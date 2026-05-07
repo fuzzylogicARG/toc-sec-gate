@@ -1,4 +1,4 @@
-rom flask import Flask, request, redirect, render_template_string
+from flask import Flask, request, redirect, render_template_string
 import base64
 import os
 import time
@@ -219,7 +219,7 @@ def unlock():
 
         return f"Invalid request: {e}"
 
-if name == "__main__":
+if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 10000))
 
