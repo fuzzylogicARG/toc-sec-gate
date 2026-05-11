@@ -1,11 +1,15 @@
 from flask import Flask, request, redirect, render_template_string
-from flask import Flask, request, redirect, render_template_string
 import base64
+import hashlib
+import hmac
 import os
+import time
 
 app = Flask(__name__)
 
-SECRET = "TOC2026"
+# Set this in Render Environment Variables:
+# GATE_SECRET = same value as SECURE_GATE_SECRET in toc_config.json
+GATE_SECRET = os.environ.get("GATE_SECRET", "TOC2026")
 
 HTML = """
 <!DOCTYPE html>
@@ -21,6 +25,7 @@ p{opacity:.75}
 .wrap{width:330px;height:66px;background:#1f2937;border-radius:15px;overflow:hidden;position:relative;margin-top:24px}
 .bar{position:absolute;left:0;top:0;height:100%;width:0;background:linear-gradient(90deg,#00e5ff,#7b61ff,#ff00aa)}
 .btn{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-weight:900;cursor:pointer;user-select:none}
+.badge{margin-top:16px;font-size:11px;opacity:.45;letter-spacing:.12em;text-transform:uppercase}
 </style>
 </head>
 <body>
@@ -31,12 +36,14 @@ p{opacity:.75}
 <div class="bar" id="bar"></div>
 <div class="btn" id="btn">HOLD TO UNLOCK</div>
 </div>
+<div class="badge">Secure Access</div>
 </div>
 <script>
 let btn=document.getElementById("btn");
 let bar=document.getElementById("bar");
 let p=0,t=null;
 function start(){
+ if(t) return;
  t=setInterval(function(){
   p+=2;
   bar.style.width=p+"%";
@@ -48,6 +55,7 @@ function start(){
 }
 function stop(){
  clearInterval(t);
+ t=null;
  p=0;
  bar.style.width="0%";
 }
@@ -61,24 +69,60 @@ btn.addEventListener("touchend",stop);
 </html>
 """
 
-def decode_token(token):
-    token = token.strip()
-    token += "=" * (-len(token) % 4)
-    raw = base64.urlsafe_b64decode(token.encode()).decode()
-    secret, url = raw.split("|", 1)
-    if secret != SECRET:
-        raise Exception("Invalid secret")
+def verify_hmac_token(token: str):
+    try:
+        payload_b64, sig = token.rsplit(".", 1)
+    except ValueError:
+        return None
+    expected_sig = hmac.new(
+        GATE_SECRET.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    if not hmac.compare_digest(expected_sig, sig):
+        return None
+    try:
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
+        expires_ts_str, real_url = payload.split("|", 1)
+        expires_ts = int(expires_ts_str)
+    except Exception:
+        return None
+    if time.time() > expires_ts:
+        return None
+    if not real_url.startswith("http"):
+        return None
+    return real_url
+
+def verify_legacy_token(token: str):
+    # Old mode: base64url(SECRET|real_url)
+    try:
+        padded = token.strip() + "=" * (-len(token.strip()) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode()).decode()
+        secret, url = raw.split("|", 1)
+    except Exception:
+        return None
+    if not hmac.compare_digest(secret, GATE_SECRET):
+        return None
+    if not url.startswith("http"):
+        return None
     return url
+
+def verify_any_token(token: str):
+    # New HMAC first, old legacy fallback second.
+    return verify_hmac_token(token) or verify_legacy_token(token)
 
 @app.route("/")
 def home():
-    return "TOC Secure Gate Online"
+    return "TOC Secure Gate Online - Dual Mode (Legacy + HMAC)"
 
 @app.route("/access")
 def access():
     token = request.args.get("t", "")
     if not token:
         return "Missing token", 400
+    if not verify_any_token(token):
+        return "Access denied: invalid or expired token", 403
     return render_template_string(HTML, token=token)
 
 @app.route("/unlock")
@@ -86,11 +130,10 @@ def unlock():
     token = request.args.get("t", "")
     if not token:
         return "Missing token", 400
-    try:
-        url = decode_token(token)
-        return redirect(url)
-    except Exception as e:
-        return "Access denied: Invalid token", 403
+    real_url = verify_any_token(token)
+    if not real_url:
+        return "Access denied: invalid or expired token", 403
+    return redirect(real_url, code=302)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
