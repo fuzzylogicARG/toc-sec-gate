@@ -1,11 +1,14 @@
-from flask import Flask, request, redirect, render_template_string
-from flask import Flask, request, redirect, render_template_string
+rom flask import Flask, request, redirect, render_template_string, abort
 import base64
+import hashlib
+import hmac
 import os
+import time
 
 app = Flask(__name__)
 
-SECRET = "TOC2026"
+# MISMO SECRET que uses en auto_post_V12_PRO.py / toc_config.json
+GATE_SECRET = os.environ.get("GATE_SECRET", "TOC2026")
 
 HTML = """
 <!DOCTYPE html>
@@ -36,7 +39,9 @@ p{opacity:.75}
 let btn=document.getElementById("btn");
 let bar=document.getElementById("bar");
 let p=0,t=null;
+
 function start(){
+ if(t) return;
  t=setInterval(function(){
   p+=2;
   bar.style.width=p+"%";
@@ -46,11 +51,14 @@ function start(){
   }
  },70);
 }
+
 function stop(){
  clearInterval(t);
+ t=null;
  p=0;
  bar.style.width="0%";
 }
+
 btn.addEventListener("mousedown",start);
 btn.addEventListener("touchstart",start);
 btn.addEventListener("mouseup",stop);
@@ -61,24 +69,51 @@ btn.addEventListener("touchend",stop);
 </html>
 """
 
-def decode_token(token):
-    token = token.strip()
-    token += "=" * (-len(token) % 4)
-    raw = base64.urlsafe_b64decode(token.encode()).decode()
-    secret, url = raw.split("|", 1)
-    if secret != SECRET:
-        raise Exception("Invalid secret")
-    return url
+def verify_token(token: str):
+    try:
+        payload_b64, sig = token.rsplit(".", 1)
+    except ValueError:
+        return None
+
+    expected_sig = hmac.new(
+        GATE_SECRET.encode("utf-8"),
+        payload_b64.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(expected_sig, sig):
+        return None
+
+    try:
+        padded = payload_b64 + "=" * (-len(payload_b64) % 4)
+        payload = base64.urlsafe_b64decode(padded.encode("utf-8")).decode("utf-8")
+        expires_ts_str, real_url = payload.split("|", 1)
+        expires_ts = int(expires_ts_str)
+    except Exception:
+        return None
+
+    if time.time() > expires_ts:
+        return None
+
+    if not real_url.startswith("http"):
+        return None
+
+    return real_url
 
 @app.route("/")
 def home():
-    return "TOC Secure Gate Online"
+    return "TOC Secure Gate Online - HMAC Mode"
 
 @app.route("/access")
 def access():
     token = request.args.get("t", "")
     if not token:
         return "Missing token", 400
+
+    # Validamos antes de mostrar el gate
+    if not verify_token(token):
+        return "Access denied: invalid or expired token", 403
+
     return render_template_string(HTML, token=token)
 
 @app.route("/unlock")
@@ -86,11 +121,12 @@ def unlock():
     token = request.args.get("t", "")
     if not token:
         return "Missing token", 400
-    try:
-        url = decode_token(token)
-        return redirect(url)
-    except Exception as e:
-        return "Access denied: Invalid token", 403
+
+    real_url = verify_token(token)
+    if not real_url:
+        return "Access denied: invalid or expired token", 403
+
+    return redirect(real_url, code=302)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
